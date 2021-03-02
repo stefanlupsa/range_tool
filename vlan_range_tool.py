@@ -1,20 +1,34 @@
 #!/usr/bin/python3
 import argparse
-import sqlite3
+import configparser
+import mysql.connector
 import re
 import time
 import sys
 
-start = 50
-end = 4000
-delta = 50
+config = configparser.ConfigParser()
+config.read('vlan_range.conf')
 
-conn = sqlite3.connect("data.db")
+db_name = config['db']['database']
+db_user = config['db']['user']
+db_pass = config['db']['password']
+db_host = config['db']['host']
+
+range_start = int(config['range']['start'])
+range_end = int(config['range']['end'])
+range_delta = int(config['range']['delta'])
+
+conn = mysql.connector.connect(host=db_host, user=db_user,
+                               password=db_pass)
 c = conn.cursor()
+c.execute('use %s' % (db_name))
 c.execute('''
     CREATE TABLE IF NOT EXISTS intervals (
-        start_key integer PRIMARY KEY,
-        date_added integer
+        start INTEGER PRIMARY KEY,
+        end INTEGER NOT NULL,
+        reserved BOOLEAN DEFAULT FALSE,
+        updated_at DATETIME,
+        instance_uuid CHAR(36)
     )
 ''')
 conn.commit()
@@ -23,11 +37,24 @@ parser = argparse.ArgumentParser(
     description="Call without arguments to reserve an interval.",
     epilog="Interval format: \d+:\d+."
 )
+
+
 group = parser.add_mutually_exclusive_group()
-group.add_argument("-r", "--reset", help="reset used intervals list", action="store_true")
-group.add_argument("-f", "--free", help="free interval", metavar="interval")
-parser.add_argument("-c", "--count", help="number of used intervals", action="store_true")
-parser.add_argument("-s", "--show", help="show used intervals", action="store_true")
+group.add_argument("-r", "--reset", help="reset intervals list and creates "
+                   "fresh entries in database", action="store_true")
+group.add_argument("-f", "--free", help="free interval, requires interval",
+                   action="store_true")
+group.add_argument("-u", "--update-uuid", help="update interval with instance "
+                   "uuid, requires interval",
+                   dest="instance_uuid")
+parser.add_argument("-i" "--interval", help="interval",
+                    dest="interval")
+parser.add_argument("-c", "--count", help="number of used intervals",
+                    action="store_true")
+parser.add_argument("-l", "--list", help="list used intervals",
+                    action="store_true")
+parser.add_argument("-s", "--show", help="show all intervals",
+                    action="store_true")
 
 
 def close(message, exit_code=0):
@@ -42,23 +69,6 @@ def close(message, exit_code=0):
 
 class Interval:
     @staticmethod
-    def get_interval(idx):
-        return Interval.get_start(idx), Interval.get_end(idx)
-
-    @staticmethod
-    def get_start(idx):
-        return start + idx * delta
-
-    @staticmethod
-    def get_end(idx):
-        return start + (idx + 1) * delta - 1
-
-    @staticmethod
-    def format(idx):
-        result = Interval.get_interval(idx)
-        return "{}:{}".format(result[0], result[1])
-
-    @staticmethod
     def parse_interval_string(string):
         result = re.match(r"^([+-]?\d+):([+-]?\d+)$", str(string))
         if result is None:
@@ -67,68 +77,77 @@ class Interval:
 
     @staticmethod
     def is_valid_interval(interval):
-        if interval[0] < start or interval[1] > end:
+        if (interval[0] < range_start or interval[1] > range_end or
+                (interval[0] + range_delta-1) != interval[1]):
             return False
         return True
 
     @staticmethod
-    def get_index(interval):
-        idx_start = (interval[0] - start) / delta
-        idx_end = (interval[1] - start + 1) / delta
-        if not(idx_start.is_integer() and idx_start == idx_end - 1):
-            return False
-        return int(idx_start)
+    def format_row(row):
+        fmt = "%d:%d reserved: %r updated: %s instance: %s" % (
+            int(row[0]), int(row[1]), bool(row[2]), row[3], row[4])
+        return fmt
 
 
 args = parser.parse_args()
+if (args.free or args.instance_uuid) and not args.interval:
+    parser.error("free and update requre -i--interval argument")
+
 if args.reset:
     c.execute("delete from intervals")
+    for i in range(range_start, range_end, range_delta):
+        c.execute("insert into intervals values "
+                  "(%d,%d,%s,FROM_UNIXTIME(%d),%s)"
+                  % (i, i+range_delta-1, "FALSE", int(time.time()), "NULL"))
     conn.commit()
 
 if args.free:
-    interval = Interval.parse_interval_string(args.free)
+    interval = Interval.parse_interval_string(args.interval)
     if not interval or not Interval.is_valid_interval(interval):
         close("incorrect interval")
-    index = Interval.get_index(interval)
-    if index is False:
-        close("incorrect interval")
-
-    c.execute("delete from intervals where start_key = ?", (index,))
+    c.execute("update intervals set "
+              "reserved=FALSE, instance_uuid=NULL, "
+              "updated_at=FROM_UNIXTIME(%d) where start=%d"
+              % (int(time.time()), int(interval[0])))
     conn.commit()
 
 if args.count:
-    c.execute("select count(*) from intervals")
+    c.execute("select count(*) from intervals where reserved=TRUE")
     print(c.fetchone()[0])
+
+if args.list:
+    c.execute("select * from intervals where reserved=TRUE")
+    rows = c.fetchall()
+    for row in rows:
+        print(Interval.format_row(row))
 
 if args.show:
     c.execute("select * from intervals")
     rows = c.fetchall()
     for row in rows:
-        print(Interval.format(row[0]))
+        print(Interval.format_row(row))
 
-if not(args.count or args.free or args.reset or args.show):
-    sql = '''
-        select min(result_key) from (
-            select min(a.start_key) - 1 as result_key 
-            from intervals a 
-            left join intervals b on a.start_key = b.start_key + 1
-            where a.start_key > 0 and b.start_key is null
-            union
-            select max(a.start_key) + 1 as result_key from intervals a
-        )
-    '''
-    c.execute(sql)
-    index = c.fetchone()[0]
+if args.instance_uuid:
+    interval = Interval.parse_interval_string(args.interval)
+    if not interval or not Interval.is_valid_interval(interval):
+        close("incorrect interval")
+    c.execute("update intervals set updated_at=FROM_UNIXTIME(%d), "
+              "instance_uuid='%s' where start=%d"
+              % (int(time.time()), args.instance_uuid, int(interval[0])))
+    conn.commit()
 
-    if index is None:
-        index = 0
-    elif Interval.get_end(index) > end:
+# reserve interval
+if len(sys.argv) == 1:
+    c.execute("select * from intervals where reserved=FALSE")
+    sql_res = c.fetchone()
+    if sql_res is None:
         close("all intervals are currently in use", 1)
-
-    try:
-        c.execute("insert into intervals values (?,?)", [index, time.time()])
+    else:
+        c.fetchall()
+        index = sql_res[0]
+        index_end = sql_res[1]
+        c.execute("update intervals set reserved=TRUE, "
+                  "updated_at=FROM_UNIXTIME(%d) where start=%d"
+                  % (int(time.time()), index))
         conn.commit()
-        print(Interval.format(index))
-    except:
-        close("concurrency error", 1)
-
+        print("%d:%d" % (index, index_end))
