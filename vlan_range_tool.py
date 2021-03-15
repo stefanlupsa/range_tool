@@ -5,9 +5,11 @@ import mysql.connector
 import re
 import time
 import sys
+import os
 
 config = configparser.ConfigParser()
-config.read('vlan_range.conf')
+config.read(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                         'vlan_range.conf'))
 
 db_name = config['db']['database']
 db_user = config['db']['user']
